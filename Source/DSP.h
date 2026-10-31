@@ -454,21 +454,37 @@ inline float fastTanh (float x)
     return x * (27.0f + x2) / (27.0f + 9.0f * x2);
 }
 
+// Polynomial soft clipper used throughout the analog models: linear near 0,
+// reaches +/-1 at +/-2 and stays flat beyond.
+inline float softSat (float x)
+{
+    x = clampf (x, -2.0f, 2.0f);
+    return x + x * x * x * (std::fabs (x) * 0.0625f - 0.25f);
+}
+
 // Diode-style clipper used in the K20 resonance path.
 inline float diode (float x) { return x / (1.0f + std::fabs (x)); }
 
-// One channel of the analog-modelled filters.
+// Per-channel state for the analog-modelled filters.
 struct AnalogChannel
 {
-    // SVF / K20 state
-    float ic1 = 0, ic2 = 0;
-    // ladder state
-    float s[4] = { 0, 0, 0, 0 };
+    float low = 0, band = 0;            // SVF
+    float s1 = 0, s2 = 0, prev2 = 0, prev1 = 0; // K20
+    float y[4] = { 0, 0, 0, 0 };        // ladder stage outputs
+    float u[4] = { 0, 0, 0, 0 };        // ladder stage previous inputs
+    uint32_t noise = 22222u;
 
     void reset()
     {
-        ic1 = ic2 = 0;
-        for (auto& v : s) v = 0;
+        low = band = s1 = s2 = prev2 = prev1 = 0;
+        for (auto& v : y) v = 0;
+        for (auto& v : u) v = 0;
+    }
+    // Tiny noise keeps self-oscillation going from silence, as on hardware.
+    float tinyNoise()
+    {
+        noise = noise * 196314165u + 907633515u;
+        return (float) noise * 2.3283064e-10f * 1.0e-6f;
     }
 };
 
@@ -476,26 +492,24 @@ struct MultiModeFilter
 {
     float sr = 44100;
     int type = LP2_BQ;
-    float cutoff = 1000, res = 0;
+    float cutoff = 1000, res = 0, cutNorm = 0.5f;
     float lastCut = -1, lastRes = -1;
     int lastType = -1;
 
-    Biquad bq[2], formant[2][3];
+    Biquad bq[2][2], formant[2][3];
     float formantGain[3] = { 1, 1, 1 };
     AnalogChannel an[2];
 
-    // comb
     std::vector<float> comb[2];
     int combPos = 0;
-    // ring mod
     float ringPhase = 0;
-    // bit reduction sample-and-hold
     float holdVal[2] = { 0, 0 };
     int holdCount = 0;
 
     // analog coefficients
-    float g = 0, k = 0, a1 = 0, a2 = 0, a3 = 0; // SVF
-    float ladderG = 0, ladderK = 0;
+    float svfF = 0, svfFl = 0, svfQ = 2;   // SVF (run at 2x)
+    float k20F = 0, k20K = 0;              // K20 (1x)
+    float ladG = 0, ladK = 0;              // XP / MG (run at 2x)
 
     void prepare (float s)
     {
@@ -507,7 +521,7 @@ struct MultiModeFilter
 
     void reset()
     {
-        for (auto& b : bq) b.reset();
+        for (auto& ch : bq) for (auto& b : ch) b.reset();
         for (auto& c : formant) for (auto& b : c) b.reset();
         for (auto& a : an) a.reset();
         for (auto& c : comb) std::fill (c.begin(), c.end(), 0.0f);
@@ -516,124 +530,147 @@ struct MultiModeFilter
         lastCut = lastRes = -1; lastType = -1;
     }
 
-    static float resToQ (float r) { return 0.70710678f * std::pow (20.0f, clampf (r, 0.0f, 1.0f)); }
+    // Biquad types: Q runs 1..7 with resonance.
+    static float biquadQ (float r) { return 1.0f + 6.0f * clampf (r, 0.0f, 1.0f); }
 
-    void setFormant (float cutNorm, float r)
+    void setFormant (float cn, float r)
     {
-        // Vowel table (A, E, I, O, U) F1..F3 in Hz; morph by cutoff.
         static const float F[5][3] = { { 800, 1150, 2900 }, { 400, 1600, 2700 }, { 350, 1700, 2700 },
                                        { 450, 800, 2830 }, { 325, 700, 2530 } };
         static const float G[3] = { 1.0f, 0.63f, 0.25f };
-        const float pos = clampf (cutNorm, 0.0f, 1.0f) * 4.0f;
+        const float pos = clampf (cn, 0.0f, 1.0f) * 4.0f;
         const int i0 = std::min (3, (int) pos);
         const float t = pos - (float) i0;
         const double q = 5.0 + 20.0 * r;
         for (int f = 0; f < 3; ++f)
         {
-            const float hz = curve::lerp (F[i0][f], F[i0 + 1][f], t);
-            formant[0][f].bandPass (sr, hz, q);
+            formant[0][f].bandPass (sr, curve::lerp (F[i0][f], F[i0 + 1][f], t), q);
             formant[1][f].copyCoeffs (formant[0][f]);
             formantGain[f] = G[f];
         }
     }
 
-    void update (int newType, float cutHz, float cutNorm, float r)
+    void setBiquads (const Biquad& b)
+    {
+        for (auto& ch : bq) { ch[0].copyCoeffs (b); ch[1].copyCoeffs (b); }
+    }
+
+    void update (int newType, float cutHz, float cn, float r)
     {
         if (newType != lastType)
         {
-            const int prev = lastType;
+            if (lastType >= 0) { for (auto& a : an) a.reset(); for (auto& ch : bq) for (auto& b : ch) b.reset(); }
             lastType = newType;
-            if (prev >= 0) { for (auto& a : an) a.reset(); for (auto& b : bq) b.reset(); }
             lastCut = -1;
         }
         type = newType;
         if (cutHz == lastCut && r == lastRes) return;
         lastCut = cutHz; lastRes = r;
-        cutoff = cutHz; res = r;
+        cutoff = cutHz; res = r; cutNorm = cn;
 
+        Biquad b;
         switch (type)
         {
-            case LP2_BQ: case LP2_FAT: bq[0].lowPass (sr, cutHz, resToQ (r)); break;
-            case BP2_BQ: case BP2_FAT: bq[0].bandPass (sr, cutHz, resToQ (r) * 1.5f); break;
-            case HP2_BQ: case HP2_FAT: bq[0].highPass (sr, cutHz, resToQ (r)); break;
-            case PEAKING: bq[0].peaking (sr, cutHz, 2.0, 24.0 * r); break;
-            case NOTCH: bq[0].notch (sr, cutHz, 0.3 + 6.0 * r); break;
-            case FORMANT: setFormant (cutNorm, r); break;
+            case LP2_BQ: b.lowPass (sr, cutHz, biquadQ (r)); setBiquads (b); break;
+            case HP2_BQ: b.highPass (sr, cutHz, biquadQ (r)); setBiquads (b); break;
+            case LP2_FAT: b.lowPass (sr, std::max (40.0f, cutHz), biquadQ (r)); setBiquads (b); break;
+            case HP2_FAT: b.highPass (sr, std::max (40.0f, cutHz), biquadQ (r)); setBiquads (b); break;
+            // Bandpass types are two cascaded sections.
+            case BP2_BQ: case BP2_FAT: b.bandPass (sr, std::max (40.0f, cutHz), 0.5f + 0.5f * biquadQ (r)); setBiquads (b); break;
+            case PEAKING: b.peaking (sr, cutHz, 1.0, 3.0f * biquadQ (r)); setBiquads (b); break;
+            case NOTCH: b.notch (sr, cutHz, std::max (0.05f, biquadQ (r) - 0.99f)); setBiquads (b); break;
+            case FORMANT: setFormant (cn, r); break;
             default: break;
         }
-        bq[1].copyCoeffs (bq[0]);
 
-        // Zero-delay-feedback (TPT) analog models, prewarped at the host rate.
-        const float fc = std::min (cutHz, sr * 0.45f);
-        g = std::tan (kPi * fc / sr);
-        k = 2.0f - 1.98f * r;               // SVF damping
-        a1 = 1.0f / (1.0f + g * (g + k));
-        a2 = g * a1;
-        a3 = g * a2;
-        ladderG = g / (1.0f + g);
-        ladderK = 4.2f * r;                  // ladder resonance (self-oscillates near 1)
+        // SVF (2x): Chamberlin coefficient, damping allowed slightly negative.
+        const float os = sr * 2.0f;
+        svfF = 2.0f * std::sin (std::min (0.78539816f, kPi * cutHz / os));
+        const float rr = 0.99f * r;
+        svfQ = clampf (2.0f - 2.02f * rr, -0.04f, 2.0f);
+        svfFl = svfF - svfQ * svfF * svfF / 6.0f;
+
+        // K20 (1x): two one-pole stages with diode-shaped feedback.
+        k20F = 2.0f * std::sin (std::min (1.2566371f, kPi * cutHz / sr)) * 0.5f;
+        k20K = clampf (2.0f * rr, 0.0f, 4.0f);
+
+        // Ladders (2x).
+        ladG = 1.0f - std::exp (-kTwoPi * std::min (cutHz, os * 0.45f) / os);
+        ladK = 4.0f * rr;
     }
 
-    // --- analog cores, one sample at 2x rate -------------------------------
-    inline float svf (AnalogChannel& c, float x, int mode, bool k20)
+    // --- cores ---------------------------------------------------------------
+    inline float svfTick (AnalogChannel& c, float x, int mode)
     {
-        const float v3 = x - c.ic2;
-        const float v1 = a1 * c.ic1 + a2 * v3;
-        const float v2 = c.ic2 + a2 * c.ic1 + a3 * v3;
-        c.ic1 = 2.0f * v1 - c.ic1;
-        c.ic2 = 2.0f * v2 - c.ic2;
-        if (k20)
-        {
-            // MS-20 flavour: diode clipping in the resonant (band) path and a
-            // soft limit on the low-pass state so high resonance screams but stays bounded.
-            c.ic1 = 1.4f * diode (c.ic1 * (0.7f + res));
-            c.ic2 = 1.5f * fastTanh (c.ic2 * (1.0f / 1.5f));
-        }
-        if (mode == 0) return v2;
-        if (mode == 1) return v1;
-        return x - k * v1 - v2;
+        const float in = 0.25f * x + c.tinyNoise();
+        c.low += svfFl * softSat (c.band);
+        const float damp = softSat ((2.0f - svfQ) * c.band) - 2.0f * c.band;
+        const float hp = softSat (in - c.low + damp);
+        c.band += svfFl * hp;
+        const float y = mode == 0 ? c.low : (mode == 1 ? c.band : hp);
+        return 4.0f * y;
     }
 
-    inline float ladder (AnalogChannel& c, float x, int mode, bool ota)
+    inline float k20Tick (AnalogChannel& c, float x, int mode)
     {
-        const float fb = c.s[3];
-        const float u = fastTanh (x - ladderK * fb);
-        float in = u;
-        float y[4];
+        const float in = 0.1f * x + c.tinyNoise();
+        const float fb = 1.4f * diode (k20K * c.s2 * 0.7f);
+        c.prev1 = c.s1; c.prev2 = c.s2;
+        c.s1 += 2.0f * k20F * softSat (in - fb - c.s1);
+        c.s2 += 2.0f * k20F * softSat (c.s1 - c.s2);
+        const float lp = 0.5f * (c.s2 + c.prev2);
+        const float s1 = 0.5f * (c.s1 + c.prev1);
+        float y;
+        if (mode == 0) y = lp;
+        else if (mode == 1) y = s1 - lp;
+        else y = in - s1;
+        return 10.0f * y;
+    }
+
+    inline float ladderTick (AnalogChannel& c, float x, int mode, bool ota)
+    {
+        const float in = softSat (0.5f * x - ladK * c.y[3] + c.tinyNoise());
+        float a = in;
         for (int i = 0; i < 4; ++i)
         {
-            // OTA (XP) saturates every stage input; Moog (MG) saturates only at
-            // the feedback summing point (above), with linear stages.
-            const float drive = ota ? fastTanh (in) : in;
-            const float v = ladderG * (drive - c.s[i]);
-            y[i] = v + c.s[i];
-            c.s[i] = y[i] + v;
-            in = y[i];
+            const float stageIn = ota ? softSat (a) : a;
+            const float u = stageIn * 0.76923078f + c.u[i] * 0.23076923f;
+            c.u[i] = stageIn;
+            c.y[i] += ladG * (u - c.y[i]);
+            a = c.y[i];
         }
-        const float A = u;
+        const float* y = c.y;
+        const float comp = 1.0f + 0.27f * ladK;
+        float out;
         switch (mode)
         {
-            case 0: return y[1] * (1.0f + 0.5f * ladderK);                          // LP2
-            case 1: return y[3] * (1.0f + 0.5f * ladderK);                          // LP4
-            case 2: return (2.0f * y[0] - 2.0f * y[1]) * (1.0f + 0.5f * ladderK);         // BP2
-            case 3: return (4.0f * y[1] - 8.0f * y[2] + 4.0f * y[3]) * (1.0f + 0.5f * ladderK); // BP4
-            case 4: return A - 2.0f * y[0] + y[1];                                  // HP2
-            default: return A - 4.0f * y[0] + 6.0f * y[1] - 4.0f * y[2] + y[3];     // HP4
+            case 0: out = y[3]; break;                                          // LP4
+            case 1: out = 4.0f * (y[1] - 2.0f * y[2] + y[3]); break;            // BP4
+            case 2: out = in - 4.0f * y[0] + 6.0f * y[1] - 4.0f * y[2] + y[3]; break; // HP4
+            case 3: out = y[1]; break;                                          // LP2
+            case 4: out = 2.0f * (y[0] - y[1]); break;                          // BP2
+            default: out = in - 2.0f * y[0] + y[1]; break;                      // HP2
         }
+        return 2.0f * out * comp;
     }
+
+    // 2x without latency: hold the input for two ticks, average the outputs.
+    template <typename Tick>
+    static inline float twice (float x, Tick&& tick) { const float a = tick (x); const float b = tick (x); return 0.5f * (a + b); }
 
     inline float processSample (int ch, float x)
     {
         auto& c = an[ch];
         switch (type)
         {
-            case LP2_BQ: case BP2_BQ: case HP2_BQ: case PEAKING: case NOTCH:
-                return bq[ch].process (x);
-            case LP2_FAT: case BP2_FAT: case HP2_FAT:
-            {
-                const float drive = 1.0f + 2.0f * res;
-                return fastTanh (bq[ch].process (fastTanh (x * drive)) * 1.2f) / std::sqrt (drive);
-            }
+            case LP2_BQ: case HP2_BQ: case PEAKING: case NOTCH:
+                return bq[ch][0].process (x);
+            case BP2_BQ:
+                return bq[ch][1].process (bq[ch][0].process (x));
+            case LP2_FAT: case HP2_FAT:
+                return softSat (bq[ch][0].process (softSat (x * 1.5f)) * 1.2f) / 1.2f;
+            case BP2_FAT:
+                return softSat (bq[ch][1].process (bq[ch][0].process (softSat (x * 1.5f))) * 1.2f) / 1.2f;
             case FORMANT:
             {
                 float y = 0;
@@ -650,46 +687,43 @@ struct MultiModeFilter
                 const int i0 = (int) pos;
                 const float fr = pos - (float) i0;
                 const float d = buf[(size_t) i0] + fr * (buf[(size_t) ((i0 + 1) % size)] - buf[(size_t) i0]);
-                const float fb = (type == COMB_P ? 1.0f : -1.0f) * 0.97f * res;
+                const float fb = (type == COMB_P ? 0.99f : -0.99f) * res;
                 float y = x + fb * d;
                 if (std::fabs (y) < 1.0e-20f) y = 0;
                 buf[(size_t) combPos] = clampf (y, -4.0f, 4.0f);
                 return y * (1.0f - 0.5f * res);
             }
             case RINGMOD:
-            {
-                const float m = std::sin (kTwoPi * ringPhase);
-                return x * curve::lerp (1.0f, m, 0.5f + 0.5f * res);
-            }
-            case TUBE: return Distortion::tube (x, std::min (1.0f, cutoff / 16000.0f + res));
-            case MECH: return Distortion::mech (x, std::min (1.0f, cutoff / 16000.0f + res));
+                return x * std::sin (kTwoPi * ringPhase);
+            case TUBE:
+                return Distortion::tube (x * (0.5f + res), cutNorm);
+            case MECH:
+                return Distortion::mech (x * (0.5f + res), cutNorm);
             case BITRED:
             {
-                // cutoff -> bit depth, resonance -> sample-rate reduction
-                const int bits = std::max (1, (int) (1.0f + 15.0f * std::sqrt (cutoff / 16000.0f)));
+                // Cutoff up = fewer bits (16 at the bottom, 1 at the top).
+                const int bits = 1 + (int) (15.0f * (1.0f - clampf (cutNorm, 0.0f, 1.0f)));
                 const float q = (float) (1 << bits);
-                const int hold = 1 + (int) (res * res * 31.0f);
-                if (holdCount % hold == 0) holdVal[ch] = std::floor (q * x + 0.5f) / q;
-                return holdVal[ch];
+                return std::floor (q * x * (0.5f + res) + 0.5f) / q;
             }
-            case LP2_SVF: return svf (c, x, 0, false);
-            case BP2_SVF: return svf (c, x, 1, false);
-            case HP2_SVF: return svf (c, x, 2, false);
-            case LP2_K20: return svf (c, x, 0, true);
-            case BP2_K20: return svf (c, x, 1, true);
-            case HP2_K20: return svf (c, x, 2, true);
-            case LP2_XP: return ladder (c, x, 0, true);
-            case LP4_XP: return ladder (c, x, 1, true);
-            case BP2_XP: return ladder (c, x, 2, true);
-            case BP4_XP: return ladder (c, x, 3, true);
-            case HP2_XP: return ladder (c, x, 4, true);
-            case HP4_XP: return ladder (c, x, 5, true);
-            case LP2_MG: return ladder (c, x, 0, false);
-            case LP4_MG: return ladder (c, x, 1, false);
-            case BP2_MG: return ladder (c, x, 2, false);
-            case BP4_MG: return ladder (c, x, 3, false);
-            case HP2_MG: return ladder (c, x, 4, false);
-            case HP4_MG: return ladder (c, x, 5, false);
+            case LP2_SVF: return twice (x, [&] (float v) { return svfTick (c, v, 0); });
+            case BP2_SVF: return twice (x, [&] (float v) { return svfTick (c, v, 1); });
+            case HP2_SVF: return twice (x, [&] (float v) { return svfTick (c, v, 2); });
+            case LP2_K20: return k20Tick (c, x, 0);
+            case BP2_K20: return k20Tick (c, x, 1);
+            case HP2_K20: return k20Tick (c, x, 2);
+            case LP4_XP: return twice (x, [&] (float v) { return ladderTick (c, v, 0, true); });
+            case BP4_XP: return twice (x, [&] (float v) { return ladderTick (c, v, 1, true); });
+            case HP4_XP: return twice (x, [&] (float v) { return ladderTick (c, v, 2, true); });
+            case LP2_XP: return twice (x, [&] (float v) { return ladderTick (c, v, 3, true); });
+            case BP2_XP: return twice (x, [&] (float v) { return ladderTick (c, v, 4, true); });
+            case HP2_XP: return twice (x, [&] (float v) { return ladderTick (c, v, 5, true); });
+            case LP4_MG: return twice (x, [&] (float v) { return ladderTick (c, v, 0, false); });
+            case BP4_MG: return twice (x, [&] (float v) { return ladderTick (c, v, 1, false); });
+            case HP4_MG: return twice (x, [&] (float v) { return ladderTick (c, v, 2, false); });
+            case LP2_MG: return twice (x, [&] (float v) { return ladderTick (c, v, 3, false); });
+            case BP2_MG: return twice (x, [&] (float v) { return ladderTick (c, v, 4, false); });
+            case HP2_MG: return twice (x, [&] (float v) { return ladderTick (c, v, 5, false); });
             default: return x;
         }
     }
