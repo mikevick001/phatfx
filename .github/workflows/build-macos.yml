@@ -1,0 +1,35 @@
+name: Build macOS plug-in
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPHATFX_COPY_AFTER_BUILD=OFF
+
+      - name: Build
+        run: cmake --build build --config Release -j 4
+
+      - name: Test
+        run: ./build/phatfx_tests
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp -R build/PhatFX_artefacts/Release/VST3/PhatFX.vst3 dist/
+          cp -R build/PhatFX_artefacts/Release/AU/PhatFX.component dist/
+          lipo -archs dist/PhatFX.vst3/Contents/MacOS/PhatFX
+          codesign --force --deep --sign - dist/PhatFX.vst3
+          codesign --force --deep --sign - dist/PhatFX.component
+          cd dist && zip -qry ../PhatFX-macOS-universal.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhatFX-macOS-universal
+          path: PhatFX-macOS-universal.zip
