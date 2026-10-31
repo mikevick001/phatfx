@@ -498,6 +498,7 @@ struct MultiModeFilter
 
     Biquad bq[2][2], formant[2][3];
     float formantGain[3] = { 1, 1, 1 };
+    float bpGain = 1, bpDry = 0;
     AnalogChannel an[2];
 
     std::vector<float> comb[2];
@@ -508,7 +509,7 @@ struct MultiModeFilter
 
     // analog coefficients
     float svfF = 0, svfFl = 0, svfQ = 2;   // SVF (run at 2x)
-    float k20F = 0, k20K = 0;              // K20 (1x)
+    float k20F = 0, k20K = 0, k20Gain = 0; // K20 (1x)
     float ladG = 0, ladK = 0;              // XP / MG (run at 2x)
 
     void prepare (float s)
@@ -568,31 +569,56 @@ struct MultiModeFilter
         lastCut = cutHz; lastRes = r;
         cutoff = cutHz; res = r; cutNorm = cn;
 
-        Biquad b;
+        Biquad b, b2;
+        const float rc = clampf (r, 0.0f, 1.0f);
         switch (type)
         {
             case LP2_BQ: b.lowPass (sr, cutHz, biquadQ (r)); setBiquads (b); break;
             case HP2_BQ: b.highPass (sr, cutHz, biquadQ (r)); setBiquads (b); break;
-            case LP2_FAT: b.lowPass (sr, std::max (40.0f, cutHz), biquadQ (r)); setBiquads (b); break;
-            case HP2_FAT: b.highPass (sr, std::max (40.0f, cutHz), biquadQ (r)); setBiquads (b); break;
-            // Bandpass types are two cascaded sections.
-            case BP2_BQ: case BP2_FAT: b.bandPass (sr, std::max (40.0f, cutHz), 0.5f + 0.5f * biquadQ (r)); setBiquads (b); break;
+            case LP2_FAT:
+                // 4-pole: Butterworth pair at Res 0, second stage carries the resonance.
+            {
+                // Both stages share the resonance (fitted to the original's response).
+                const float sat = 1.0f - std::exp (-4.0f * rc);
+                b.lowPass (sr, std::max (40.0f, cutHz), 0.54f + 2.4f * sat);
+                b2.lowPass (sr, std::max (40.0f, cutHz), 1.31f + 2.2f * sat + 1.5f * rc * rc);
+            }
+                for (auto& ch : bq) { ch[0].copyCoeffs (b); ch[1].copyCoeffs (b2); }
+                break;
+            case HP2_FAT: b.highPass (sr, std::max (40.0f, cutHz), 2.4f + 2.3f * std::min (1.0f, 2.0f * rc)); setBiquads (b); break;
+            case BP2_BQ:
+                // Constant-skirt bandpass: the peak rises with resonance (+3 .. +20 dB).
+                // Resonance raises the peak and widens the band.
+                bpGain = 1.5f + 0.67f * rc;
+                b.bandPass (sr, cutHz * (1.0f - 0.13f * rc * rc), 2.1f / (1.0f + 6.4f * rc)); setBiquads (b);
+                bpDry = 0.0f;
+                break;
+            case BP2_FAT:
+                // Bandpass at Res 0, morphing towards a resonant peak over a flat floor.
+                b.bandPass (sr, std::max (40.0f, cutHz), 0.57f + 1.3f * std::min (1.0f, 2.0f * rc)); setBiquads (b);
+                bpGain = 1.43f + 5.9f * std::pow (rc, 1.3f);
+                bpDry = std::min (1.0f, 1.8f * rc);
+                break;
             case PEAKING: b.peaking (sr, cutHz, 1.0, 3.0f * biquadQ (r)); setBiquads (b); break;
-            case NOTCH: b.notch (sr, cutHz, std::max (0.05f, biquadQ (r) - 0.99f)); setBiquads (b); break;
-            case FORMANT: setFormant (cn, r); break;
+            case NOTCH: b.notch (sr, cutHz, std::min (50.0f, 0.14f / std::pow (std::max (rc, 0.001f), 1.4f))); setBiquads (b); break;
+            case FORMANT:
+                // A 0 dB-peak bandpass that narrows to silence as resonance falls.
+                b.bandPass (sr, cutHz, std::min (1000.0f, 5.6f / std::max (std::pow (rc, 2.1f), 1.0e-6f))); setBiquads (b);
+                break;
             default: break;
         }
 
         // SVF (2x): Chamberlin coefficient, damping allowed slightly negative.
         const float os = sr * 2.0f;
-        svfF = 2.0f * std::sin (std::min (0.78539816f, kPi * cutHz / os));
+        svfF = 2.0f * std::sin (std::min (0.78539816f, kPi * 0.85f * cutHz / os));
         const float rr = 0.99f * r;
         svfQ = clampf (2.0f - 2.02f * rr, -0.04f, 2.0f);
         svfFl = svfF - svfQ * svfF * svfF / 6.0f;
 
         // K20 (1x): two one-pole stages with diode-shaped feedback.
         k20F = 2.0f * std::sin (std::min (1.2566371f, kPi * cutHz / sr)) * 0.5f;
-        k20K = clampf (2.0f * rr, 0.0f, 4.0f);
+        k20K = 1.0f + 4.0f * rr;
+        k20Gain = 0.46f * std::pow (rr, 0.4f);
 
         // Ladders (2x).
         ladG = 1.0f - std::exp (-kTwoPi * std::min (cutHz, os * 0.45f) / os);
@@ -614,16 +640,19 @@ struct MultiModeFilter
     inline float k20Tick (AnalogChannel& c, float x, int mode)
     {
         const float in = 0.1f * x + c.tinyNoise();
-        const float fb = 1.4f * diode (k20K * c.s2 * 0.7f);
+        // Diode-shaped feedback from stage 2: subtracted at stage 1, added at
+        // stage 2, which keeps the passband level while creating the peak.
+        const float fb = k20Gain * diode (k20K * c.s2);
         c.prev1 = c.s1; c.prev2 = c.s2;
         c.s1 += 2.0f * k20F * softSat (in - fb - c.s1);
-        c.s2 += 2.0f * k20F * softSat (c.s1 - c.s2);
-        const float lp = 0.5f * (c.s2 + c.prev2);
-        const float s1 = 0.5f * (c.s1 + c.prev1);
+        c.s2 += 2.0f * k20F * softSat (c.s1 + fb - c.s2);
+        // Effective stage-1 output including the feedback, so BP/HP null at DC.
+        const float t1 = c.s1 + fb, lp = c.s2;
         float y;
-        if (mode == 0) y = lp;
-        else if (mode == 1) y = s1 - lp;
-        else y = in - s1;
+        if (mode == 0) y = 0.5f * (c.s2 + c.prev2);   // half-sample smoothing on the output
+        else if (mode == 1) y = 1.2f * (t1 - lp);
+        else y = in - t1;                              // 6 dB/oct high-pass plus resonance
+
         return 10.0f * y;
     }
 
@@ -640,18 +669,19 @@ struct MultiModeFilter
             a = c.y[i];
         }
         const float* y = c.y;
-        const float comp = 1.0f + 0.27f * ladK;
+        // MG keeps the ladder's natural passband loss; XP over-compensates it.
+        const float comp = ota ? 1.0f + 2.0f * ladK : 1.0f;
         float out;
         switch (mode)
         {
             case 0: out = y[3]; break;                                          // LP4
-            case 1: out = 4.0f * (y[1] - 2.0f * y[2] + y[3]); break;            // BP4
+            case 1: out = (ota ? 4.0f : 3.0f) * (y[1] - 2.0f * y[2] + y[3]); break; // BP4
             case 2: out = in - 4.0f * y[0] + 6.0f * y[1] - 4.0f * y[2] + y[3]; break; // HP4
             case 3: out = y[1]; break;                                          // LP2
-            case 4: out = 2.0f * (y[0] - y[1]); break;                          // BP2
+            case 4: out = (ota ? 2.0f : 1.5f) * (y[0] - y[1]); break;           // BP2
             default: out = in - 2.0f * y[0] + y[1]; break;                      // HP2
         }
-        return 2.0f * out * comp;
+        return 2.0f * out * comp;  // input was halved
     }
 
     // 2x without latency: hold the input for two ticks, average the outputs.
@@ -663,20 +693,18 @@ struct MultiModeFilter
         auto& c = an[ch];
         switch (type)
         {
+            case FORMANT:
+                return res < 0.02f ? 0.0f : bq[ch][0].process (x);  // silent at Res 0, like the original
             case LP2_BQ: case HP2_BQ: case PEAKING: case NOTCH:
                 return bq[ch][0].process (x);
             case BP2_BQ:
-                return bq[ch][1].process (bq[ch][0].process (x));
-            case LP2_FAT: case HP2_FAT:
-                return softSat (bq[ch][0].process (softSat (x * 1.5f)) * 1.2f) / 1.2f;
+                return bpGain * bq[ch][0].process (x);
+            case LP2_FAT:
+                return softSat (bq[ch][1].process (bq[ch][0].process (x)));
+            case HP2_FAT:
+                return softSat (bq[ch][0].process (x));
             case BP2_FAT:
-                return softSat (bq[ch][1].process (bq[ch][0].process (softSat (x * 1.5f))) * 1.2f) / 1.2f;
-            case FORMANT:
-            {
-                float y = 0;
-                for (int f = 0; f < 3; ++f) y += formantGain[f] * formant[ch][f].process (x);
-                return y * 5.0f;
-            }
+                return softSat (bpDry * x + bpGain * bq[ch][0].process (x));
             case COMB_P: case COMB_M:
             {
                 auto& buf = comb[ch];
@@ -691,20 +719,27 @@ struct MultiModeFilter
                 float y = x + fb * d;
                 if (std::fabs (y) < 1.0e-20f) y = 0;
                 buf[(size_t) combPos] = clampf (y, -4.0f, 4.0f);
-                return y * (1.0f - 0.5f * res);
+                return y;
             }
             case RINGMOD:
                 return x * std::sin (kTwoPi * ringPhase);
             case TUBE:
-                return Distortion::tube (x * (0.5f + res), cutNorm);
+            {
+                // Gain set by cutoff position (fitted): about 2.8x .. 3.9x.
+                const float g = 2.104f + 1.755f * cutNorm;
+                return Distortion::tube (x, (g - 1.0f) * 0.25f);
+            }
             case MECH:
-                return Distortion::mech (x * (0.5f + res), cutNorm);
+            {
+                const float g = 3.42f + 4.93f * cutNorm;
+                return Distortion::mech (x, (g - 1.0f) * 0.1f);
+            }
             case BITRED:
             {
                 // Cutoff up = fewer bits (16 at the bottom, 1 at the top).
                 const int bits = 1 + (int) (15.0f * (1.0f - clampf (cutNorm, 0.0f, 1.0f)));
                 const float q = (float) (1 << bits);
-                return std::floor (q * x * (0.5f + res) + 0.5f) / q;
+                return std::floor (q * x * 1.5f + 0.5f) / q;
             }
             case LP2_SVF: return twice (x, [&] (float v) { return svfTick (c, v, 0); });
             case BP2_SVF: return twice (x, [&] (float v) { return svfTick (c, v, 1); });
