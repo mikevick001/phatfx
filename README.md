@@ -52,6 +52,31 @@ The headless DSP tests build alongside the plug-in. Run them with:
 ./build/phatfx_tests
 ```
 
+## Original look and factory presets
+
+If you own the original plug-in, PhatFX can use its skin and preset banks. It
+reads them at runtime from the original data folder:
+
+- `/Library/Application Support/Camel Audio/CamelPhatData`, or
+- `~/Library/Application Support/Camel Audio/CamelPhatData`
+
+When that folder exists, the plug-in window uses the original skin, and the
+factory banks appear in the preset menu (click the value readout; the arrows
+next to it step through presets) and as host programs. Without the folder,
+PhatFX uses its own interface. No skin or preset files are distributed with
+PhatFX.
+
+To install the data folder from your own original installer DMG without
+running its old installer package, run this in Terminal:
+
+```bash
+DMG=$(find ~/Downloads ~/Desktop -maxdepth 2 -name "CamelPhat*.dmg" | head -1); MNT=$(hdiutil attach -nobrowse "$DMG" | grep -o '/Volumes/.*' | head -1); cd ~ && pax -r -f "$(find "$MNT" -path '*Install Support Files.pkg/Contents/Archive.pax' | head -1)"; hdiutil detach "$MNT" -quiet; ls ~/Library/Application\ Support/Camel\ Audio/CamelPhatData
+```
+
+This unpacks the skin and banks into `~/Library/Application Support/Camel Audio/`,
+and the original manual into `~/Applications/Camel Audio/`. Reopen the plug-in
+window afterwards.
+
 ## Signal chain
 
 Processing runs in 64-sample blocks, and the LFOs update once per block, as in

@@ -56,7 +56,8 @@ juce_add_plugin(PhatFX
 target_sources(PhatFX PRIVATE
     Source/Params.cpp
     Source/PluginProcessor.cpp
-    Source/PluginEditor.cpp)
+    Source/PluginEditor.cpp
+    Source/SkinEditor.cpp)
 
 target_compile_definitions(PhatFX PUBLIC
     JUCE_WEB_BROWSER=0
