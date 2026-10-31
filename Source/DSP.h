@@ -39,8 +39,14 @@ inline float cutoffHz (float v)
     return 80.0f + 15920.0f * std::max (0.0f, x);
 }
 
-// Bandpass section edge frequency, 20 Hz .. 20 kHz, logarithmic.
-inline float bandHz (float v) { return 20.0f * std::pow (1000.0f, clampf (v, 0.0f, 1.0f)); }
+// Bandpass section edge frequency in 285 steps: 1 Hz steps from 20 to 80 Hz,
+// then 2.5% steps up to 20 kHz (matches the original's knob law).
+inline float bandHz (float v)
+{
+    const int i = (int) (clampf (v, 0.0f, 1.0f) * 284.0f);
+    if (i <= 60) return 20.0f + (float) i;
+    return std::min (20000.0f, 80.0f * std::pow (1.02505f, (float) (i - 60)));
+}
 
 // Master volume taper (0 dB at full scale).
 inline float masterGain (float v) { return (float) std::pow ((double) std::max (0.0f, v), 2.737); }
@@ -403,7 +409,11 @@ struct BandPass
         if (fLo == lo && fHi == hi && qLo == qlo && qHi == qhi) return;
         lo = fLo; hi = fHi; qlo = qLo; qhi = qHi;
         Biquad h, p;
-        h.highPass (sr, fLo, (1.0 - qLo) + 0.6);
+        // The low edge's effective frequency rises towards Nyquist (as in the
+        // original), so the top of the range closes the band.
+        const double rel = fLo / sr;
+        const double warped = std::min (0.495 * sr, fLo * (1.0 + 2.9 * rel * rel));
+        h.highPass (sr, warped, 0.95 + 1.25 * qLo);      // Q Low: ~0.95 (smooth) .. 2.2 (resonant)
         p.lowPass (sr, fHi, 1.5 * qHi + 0.25);
         for (int c = 0; c < 2; ++c)
             for (int s = 0; s < 2; ++s) { hp[c][s].copyCoeffs (h); lp[c][s].copyCoeffs (p); }
@@ -511,6 +521,7 @@ struct MultiModeFilter
     float svfF = 0, svfFl = 0, svfQ = 2;   // SVF (run at 2x)
     float k20F = 0, k20K = 0, k20Gain = 0; // K20 (1x)
     float ladG = 0, ladK = 0;              // XP / MG (run at 2x)
+    float xpLevel = 1.0f;
 
     void prepare (float s)
     {
@@ -658,7 +669,9 @@ struct MultiModeFilter
 
     inline float ladderTick (AnalogChannel& c, float x, int mode, bool ota)
     {
-        const float in = softSat (0.5f * x - ladK * c.y[3] + c.tinyNoise());
+        // XP runs with more internal headroom than MG before its stage saturators clip.
+        const float level = ota ? xpLevel : 0.5f;
+        const float in = softSat (level * x - ladK * c.y[3] + c.tinyNoise());
         float a = in;
         for (int i = 0; i < 4; ++i)
         {
@@ -675,13 +688,13 @@ struct MultiModeFilter
         switch (mode)
         {
             case 0: out = y[3]; break;                                          // LP4
-            case 1: out = (ota ? 4.0f : 3.0f) * (y[1] - 2.0f * y[2] + y[3]); break; // BP4
+            case 1: out = 3.0f * (y[1] - 2.0f * y[2] + y[3]); break;            // BP4
             case 2: out = in - 4.0f * y[0] + 6.0f * y[1] - 4.0f * y[2] + y[3]; break; // HP4
             case 3: out = y[1]; break;                                          // LP2
-            case 4: out = (ota ? 2.0f : 1.5f) * (y[0] - y[1]); break;           // BP2
+            case 4: out = 1.5f * (y[0] - y[1]); break;                          // BP2
             default: out = in - 2.0f * y[0] + y[1]; break;                      // HP2
         }
-        return 2.0f * out * comp;  // input was halved
+        return out * comp / level;
     }
 
     // 2x without latency: hold the input for two ticks, average the outputs.
@@ -771,12 +784,17 @@ struct MultiModeFilter
     }
 };
 
-// Wrapper with the envelope follower, wet/dry mix and output soft knee.
+// Wrapper with the envelope follower, wet/dry mix and the output stage.
+// The output stage depends on the filter group, as in the original:
+//   biquad/comb/ring types -> slow-recovery level limiter
+//   Fat types               -> soft knee
+//   analog, formant, distortion types -> none (only the master clip applies)
 struct FilterSection
 {
     MultiModeFilter filter;
-    EnvelopeFollower env;
-    float sr = 44100;
+    EnvelopeFollower env, limEnv;
+    float sr = 44100, limGain = 1, limSlope = 0;
+    int lastType = -1;
 
     void prepare (float s)
     {
@@ -784,6 +802,21 @@ struct FilterSection
         filter.prepare (s);
         env.setSampleRate (s);
         env.reset();
+        limEnv.setTimes (0.0075f, 0.05f);
+        limEnv.setSampleRate (s);
+        limEnv.reset();
+        limGain = 1; limSlope = 0;
+    }
+
+    static int outputGroup (int type)
+    {
+        switch (type)
+        {
+            case LP2_BQ: case BP2_BQ: case HP2_BQ: case PEAKING: case NOTCH:
+            case COMB_P: case COMB_M: case RINGMOD: return 1;
+            case LP2_FAT: case BP2_FAT: case HP2_FAT: return 2;
+            default: return 0;
+        }
     }
 
     // cutoffParam/envAmt/res/mix are unit values; attack/decay in seconds.
@@ -791,6 +824,8 @@ struct FilterSection
                   float mix, float attack, float decay)
     {
         if (env.attack != attack || env.release != decay) env.setTimes (attack, decay);
+        if (type != lastType) { lastType = type; limGain = 1; limSlope = 0; limEnv.reset(); }
+        const int group = outputGroup (type);
 
         // The envelope is tracked per sample, the filter updated every 16 samples.
         constexpr int sub = 16;
@@ -799,9 +834,8 @@ struct FilterSection
             const int m = std::min (sub, n - start);
             float e = env.env;
             for (int i = 0; i < m; ++i)
-                e = env.process ((std::fabs (l[start + i]) + std::fabs (r[start + i])) * 0.5f);
-            const float envNorm = std::min (1.0f, e * 2.0f);
-            const float x = envAmt * envNorm * cutoffParam + (1.0f - envAmt) * cutoffParam;
+                e = env.process ((l[start + i] + r[start + i]) * 0.25f);  // half the L/R average
+            const float x = envAmt * e * cutoffParam + (1.0f - envAmt) * cutoffParam;
             filter.update (type, curve::cutoffHz (x), x, res);
 
             for (int i = start; i < start + m; ++i)
@@ -810,8 +844,21 @@ struct FilterSection
                 float wl = filter.processSample (0, dl);
                 float wr = filter.processSample (1, dr);
                 filter.advance();
-                wl = softKnee (clampf (wl, -1.0f, 1.0f), 0.7f, 1.0f, 1.0f);
-                wr = softKnee (clampf (wr, -1.0f, 1.0f), 0.7f, 1.0f, 1.0f);
+                if (group == 1)
+                {
+                    const float pk = limEnv.process (std::max (std::fabs (wl), std::fabs (wr)));
+                    if (pk > 1.0f)
+                    {
+                        const float target = 1.0f / pk;
+                        if (target < limGain) { limGain = target; limSlope = (1.0f - target) / (7.5f * sr); }
+                    }
+                    if (limGain < 1.0f) { wl *= limGain; wr *= limGain; limGain = std::min (1.0f, limGain + limSlope); }
+                }
+                else if (group == 2)
+                {
+                    wl = softKnee (clampf (wl, -1.0f, 1.0f), 0.7f, 1.0f, 1.0f);
+                    wr = softKnee (clampf (wr, -1.0f, 1.0f), 0.7f, 1.0f, 1.0f);
+                }
                 l[i] = mix * wl + (1.0f - mix) * dl;
                 r[i] = mix * wr + (1.0f - mix) * dr;
             }
@@ -851,13 +898,14 @@ inline const char* syncRateName (int i)
 }
 // Rate knob (unit) -> sync index: knob up = faster.
 inline int syncIndex (float v) { return std::min (kNumSyncRates - 1, (int) ((1.0f - v) * kNumSyncRates)); }
-// Free-running rate: 0.02 .. 8 Hz, exponential.
-inline float freeRateHz (float v) { return 0.02f * std::pow (400.0f, clampf (v, 0.0f, 1.0f)); }
+// Free-running rate: 0.02 .. 8 Hz, linear (as in the original).
+inline float freeRateHz (float v) { return 0.02f + 7.98f * clampf (v, 0.0f, 1.0f); }
 
 struct Lfo
 {
     double phase = 0;
     float randA = 0, randB = 0;
+    float out = 0;          // slew-limited output (what modulates the target)
     uint32_t seed = 0x1234567u;
     int lastCycle = -1;
 
@@ -867,9 +915,8 @@ struct Lfo
         return (float) ((seed >> 8) & 0xFFFF) / 32767.5f - 1.0f;
     }
 
-    void reset() { phase = 0; lastCycle = -1; }
+    void reset() { phase = 0; lastCycle = -1; out = 0; }
 
-    // Advance by `seconds` at `hz`, or set an absolute phase (from host).
     void advance (double hz, double seconds) { setPhase (phase + hz * seconds); }
 
     void setPhase (double p)
@@ -884,24 +931,52 @@ struct Lfo
         phase = p;
     }
 
-    // Bipolar value in -1..1
+    // Ideal shape at grid point k of 0..100 (bipolar). k == 100 wraps to the
+    // cycle start, so discontinuous shapes ramp over the last 1% before a jump.
+    static float gridValue (int shape, int k)
+    {
+        const float p = (float) k / 100.0f;
+        const float sine = std::sin (kTwoPi * p);
+        float q = p + 0.25f; if (q >= 1.0f) q -= 1.0f;
+        const float tri = 1.0f - 4.0f * std::fabs (q - 0.5f);   // starts at 0, rising
+        switch (shape)
+        {
+            case SINE: return sine;
+            case TRIANGLE: return tri;
+            case RAMP_UP: return k >= 100 ? -1.0f : 2.0f * p - 1.0f;
+            case RAMP_DOWN: return k >= 100 ? 1.0f : 1.0f - 2.0f * p;
+            case SQUARE: return (k < 50 || k >= 100) ? -1.0f : 1.0f;
+            case INV_SINE: return -sine;
+            case INV_TRIANGLE: return -tri;
+            case INV_SQUARE: return (k < 50 || k >= 100) ? 1.0f : -1.0f;
+            default: return 0;
+        }
+    }
+
+    // Bipolar shape value in -1..1: a 101-point shape with linear interpolation,
+    // matching how the original renders its LFO shapes.
     float value (int shape) const
     {
         const float p = (float) (phase - std::floor (phase));
-        switch (shape)
+        if (shape == RANDOM_SQUARE) return randB;
+        if (shape == RANDOM_TRIANGLE)
         {
-            case SINE: return std::sin (kTwoPi * p);
-            case TRIANGLE: return 1.0f - 4.0f * std::fabs (p - 0.5f) ;
-            case RAMP_UP: return 2.0f * p - 1.0f;
-            case RAMP_DOWN: return 1.0f - 2.0f * p;
-            case SQUARE: return p < 0.5f ? 1.0f : -1.0f;
-            case RANDOM_SQUARE: return randB;
-            case RANDOM_TRIANGLE: return curve::lerp (randA, randB, p);
-            case INV_SINE: return -std::sin (kTwoPi * p);
-            case INV_TRIANGLE: return -(1.0f - 4.0f * std::fabs (p - 0.5f));
-            case INV_SQUARE: return p < 0.5f ? -1.0f : 1.0f;
-            default: return 0;
+            // Ramps from the previous to the new random value, twice per cycle.
+            const float t = p < 0.5f ? 2.0f * p : 2.0f * p - 1.0f;
+            return curve::lerp (randA, randB, t);
         }
+        const float x = p * 100.0f;
+        const int k = std::min (99, (int) x);
+        const float f = x - (float) k;
+        return curve::lerp (gridValue (shape, k), gridValue (shape, k + 1), f);
+    }
+
+    // Move the output towards depth/2 * shape, at most full scale per 10 ms.
+    void slew (int shape, float depth, int samples, float sr)
+    {
+        const float target = 0.5f * depth * value (shape);
+        const float maxStep = (float) samples / (0.01f * sr);
+        out = target > out ? std::min (target, out + maxStep) : std::max (target, out - maxStep);
     }
 };
 

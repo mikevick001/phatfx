@@ -80,16 +80,43 @@ struct Engine
 
     static bool on (float v) { return v > 0.5f; }
 
-    void applyLfos (double bpm, double ppq, bool playing, int n)
+    // The original adds the LFO to the target's value in its own units and
+    // clamps the result to 0..1. For targets whose range isn't 0..1 (times,
+    // rates, tune) this pins them low; reproduced here for fidelity.
+    static void engRange (Param p, float& lo, float& hi)
+    {
+        lo = 0.0f; hi = 1.0f;
+        if (p == P_mmAttack) { lo = 0.01f; hi = 1.0f; }
+        else if (p == P_mmDecay) { lo = 0.2f; hi = 3.0f; }
+        else if (p == P_flRate) { lo = 0.02f; hi = 2.0f; }
+        else if (p == P_eqTune) { lo = 60.0f; hi = 120.0f; }
+        else if (p == P_compRelease) { lo = 100.0f; hi = 2000.0f; }
+        else if (p == P_compAmount) { lo = 0.0f; hi = 0.99f; }
+    }
+
+    void applyLfos()
     {
         std::copy (std::begin (base), std::end (base), std::begin (eff));
-        const Param onP[2] = { P_lfo1On, P_lfo2On };
+        for (int i = 0; i < 2; ++i)
+        {
+            const int o = i * (P_lfo2On - P_lfo1On);
+            if (! on (base[P_lfo1On + o])) continue;
+            const Param target = lfoTargetParam ((int) base[P_lfo1Target + o]);
+            float lo, hi;
+            engRange (target, lo, hi);
+            const float engValue = clampf (lo + (hi - lo) * eff[target] + lfo[i].out, 0.0f, 1.0f);
+            eff[target] = (engValue - lo) / (hi - lo);   // may leave 0..1 for non-unit ranges
+        }
+    }
+
+    // Called after each block, like the original: the new value applies next block.
+    void advanceLfos (double bpm, double ppq, bool playing, int n)
+    {
         for (int i = 0; i < 2; ++i)
         {
             const int o = i * (P_lfo2On - P_lfo1On);
             const float rate = base[P_lfo1Rate + o];
-            const bool synced = on (base[P_lfo1Sync + o]);
-            if (synced)
+            if (on (base[P_lfo1Sync + o]))
             {
                 const double beats = syncRateBars (syncIndex (rate)) * 4.0;
                 const double safeBpm = bpm > 0 ? bpm : 120.0;
@@ -97,17 +124,9 @@ struct Engine
                 else lfo[i].advance (safeBpm / 60.0 / beats, (double) n / sr);
             }
             else
-            {
                 lfo[i].advance (freeRateHz (rate), (double) n / sr);
-            }
-
+            lfo[i].slew ((int) base[P_lfo1Shape + o], base[P_lfo1Depth + o], n, sr);
             lfoValue[i] = lfo[i].value ((int) base[P_lfo1Shape + o]);
-            if (! on (base[onP[i]])) continue;
-            const Param target = lfoTargetParam ((int) base[P_lfo1Target + o]);
-            // LFO2 can't be modulated by LFO1 here (targets exclude LFO params),
-            // so read depth from base.
-            const float depth = base[P_lfo1Depth + o];
-            eff[target] = clampf (eff[target] + 0.5f * depth * lfoValue[i], 0.0f, 1.0f);
         }
     }
 
@@ -118,9 +137,10 @@ struct Engine
         while (done < numSamples)
         {
             const int n = std::min (kBlock, numSamples - done);
-            const double blockPpq = ppq + (bpm / 60.0) * (double) done / sr;
-            applyLfos (bpm, blockPpq, playing, n);
+            const double blockPpq = ppq + (bpm / 60.0) * (double) (done + n) / sr;
+            applyLfos();
             processBlock (L + done, R + done, n);
+            advanceLfos (bpm, blockPpq, playing, n);
             done += n;
         }
     }
@@ -161,7 +181,7 @@ struct Engine
         if (on (e[P_eqOn])) magicEq.process (l, r, n, e[P_eqAmount], 60.0f + 60.0f * e[P_eqTune], on (e[P_eqMode]));
 
         if (on (e[P_compOn]))
-            comp.process (l, r, n, 0.99f * e[P_compAmount], 100.0f + 1900.0f * e[P_compRelease], on (e[P_compMode]));
+            comp.process (l, r, n, std::min (0.99f, 0.99f * e[P_compAmount]), 100.0f + 1900.0f * e[P_compRelease], on (e[P_compMode]));
 
         // Band-reject remainder is added back after the chain.
         const float brTarget = e[P_bpBRMix];

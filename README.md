@@ -100,22 +100,35 @@ distortions come before them.
 | MagicEQ | Amount, Tune 60–120 Hz, Mode | +10 dB peak (Q 1) at Tune, then a 40 Hz high-pass. Limit mode adds a slow-recovery limiter; Clip mode clips hard. |
 | Compressor | Amount (0 to −40 dB threshold), Release 100–2000 ms, Mode | Makeup gain is applied first (1/(1−amount)), then a soft knee from 0.31 up to a 1.0 ceiling, instant attack and linear release. Smooth mode detects with a 30/80 ms envelope instead of raw peaks. |
 | Master | Mix, Volume (taper x^2.737, 0 dB at max) | Wet/dry is taken around the whole chain. |
-| LFO 1/2 | Target (23 destinations), Shape (10), Depth, Rate, Sync | Synced rates run from 1/32T to 4/1 dotted. Modulation adds ±depth/2 to the target. |
+| LFO 1/2 | Target (23 destinations), Shape (10), Depth, Rate, Sync | Free rate 0.02–8 Hz (linear); synced rates from 1/32T to 4/1 dotted. Shapes are 101-point curves with linear interpolation; the output is slew-limited (full scale per 10 ms) and updates once per 64-sample block. Modulation adds ±depth/2 to the target in its own units and clamps to 0–1, as the original does. |
 | XY Morph | X and Y target (27 destinations) | Dragging the pad writes both target parameters, which the host can automate. |
 
 Filter types: LP2/BP2/HP2 BQ and Fat, Formant, Peaking, Notch, CombP, CombM,
 RingMod, Tube, Mech, Bit Red, and the "HQ" analog models. The HQ models are
 LP2/BP2/HP2 SVF and K20, plus LP2/LP4/BP2/BP4/HP2/HP4 XP and MG.
 
+## Verification against the original
+
+PhatFX was checked side by side against the original plug-in's own DSP code,
+loaded directly from its Intel binary on an x86-64 machine and fed identical
+test audio (the original binary and the test harness are not part of this
+repository):
+
+- Compressor, Tube, Mech and BitCrush: identical output. Flanger and Xcita
+  within 0.2 dB; MagicEQ and the bandpass section within about 0.5–1 dB.
+- The 8 deterministic LFO shapes: identical output at all tested rates and depths.
+- All 704 factory presets through the full chain (LFOs on): median difference
+  0.46 dB per 1/3-octave band; 607 of 620 presets within 3 dB, worst 6 dB.
+  The 84 presets using the two random LFO shapes can't be matched sample for
+  sample, because the original uses the macOS random-number generator.
+
 ## What is not identical
 
-- **Exact sound.** The routing, gain staging, curves and section algorithms
-  follow the original. The 33 filter cores are new designs in the same style:
-  zero-delay SVF, MS-20-style SVF with diode clipping (K20), OTA cascade (XP)
-  and transistor-ladder style (MG). Expect a close match, not a bit-exact one.
+- **Exact sound.** The filter cores are new code fitted to the original's
+  measured responses, so heavily driven or extreme filter settings can still
+  differ by a few dB (see the verification figures above).
+- **Random LFO shapes** produce a different random sequence than the original.
 - **Factory presets.** These lived in the original's data folder, which wasn't
   in the upload, so none are included.
 - **Interface.** The interface is new. It is not a copy of the original skin.
-- **Free-running LFO rate** uses an exponential 0.02–8 Hz curve so slow rates
-  are easier to set.
 - **Comp Mode / MagicEQ Mode labels** are inferred from what each flag does.
